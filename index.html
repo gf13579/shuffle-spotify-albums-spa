@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Album Shuffle</title>
+  <style>
+    *, *::before, *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background: #121212;
+      color: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      min-height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 1.75rem;
+    }
+
+    h1 {
+      font-size: 1.4rem;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: #b3b3b3;
+    }
+
+    #main-btn {
+      background: #1db954;
+      color: #000;
+      border: none;
+      border-radius: 500px;
+      font-size: 1rem;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      padding: 1rem 3rem;
+      cursor: pointer;
+      min-width: 220px;
+      transition: background 120ms ease, transform 80ms ease;
+    }
+
+    #main-btn:hover:not(:disabled) {
+      background: #1ed760;
+    }
+
+    #main-btn:active:not(:disabled) {
+      transform: scale(0.97);
+    }
+
+    #main-btn:disabled {
+      background: #535353;
+      color: #b3b3b3;
+      cursor: default;
+    }
+
+    #status {
+      font-size: 0.875rem;
+      color: #b3b3b3;
+      text-align: center;
+      min-height: 1.25em;
+      max-width: 380px;
+      line-height: 1.5;
+    }
+
+    #status.error {
+      color: #f15e6c;
+    }
+  </style>
+</head>
+<body>
+  <h1>Album Shuffle</h1>
+  <button id="main-btn">Connect Spotify</button>
+  <p id="status"></p>
+
+  <script>
+    // ─── Configuration ────────────────────────────────────────────────────────
+    //
+    // 1. Register an app at https://developer.spotify.com/dashboard
+    // 2. Under "Redirect URIs", add EXACTLY the value of REDIRECT_URI below.
+    //    For local dev: http://localhost:8080
+    //
+    const CLIENT_ID   = 'fd36081da8d442daae2a4ca19b379b9a';
+    const REDIRECT_URI = 'http://127.0.0.1:8888';
+
+    // ─── Constants ────────────────────────────────────────────────────────────
+    const SCOPES    = 'user-library-read user-modify-playback-state';
+    const API_BASE  = 'https://api.spotify.com/v1';
+    const TOKEN_URL = 'https://accounts.spotify.com/api/token';
+    const AUTH_URL  = 'https://accounts.spotify.com/authorize';
+
+    // ─── Storage helpers ──────────────────────────────────────────────────────
+    const store = {
+      get: key       => localStorage.getItem(key),
+      set: (key, v)  => localStorage.setItem(key, String(v)),
+      del: key       => localStorage.removeItem(key),
+    };
+
+    // ─── PKCE helpers ─────────────────────────────────────────────────────────
+    function generateRandomString(length) {
+      const possible = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+      const values   = crypto.getRandomValues(new Uint8Array(length));
+      return values.reduce((acc, x) => acc + possible[x % possible.length], '');
+    }
+
+    async function sha256(plain) {
+      const data = new TextEncoder().encode(plain);
+      return crypto.subtle.digest('SHA-256', data);
+    }
+
+    function base64urlEncode(buffer) {
+      // SHA-256 output is 32 bytes — safe to spread without stack overflow
+      return btoa(String.fromCharCode(...new Uint8Array(buffer)))
+        .replace(/=/g,  '')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_');
+    }
+
+    // ─── Auth ─────────────────────────────────────────────────────────────────
+    async function redirectToSpotifyAuth() {
+      const codeVerifier  = generateRandomString(64);
+      const hashed        = await sha256(codeVerifier);
+      const codeChallenge = base64urlEncode(hashed);
+      const state         = generateRandomString(16);
+
+      store.set('pkce_verifier', codeVerifier);
+      store.set('pkce_state',    state);
+
+      const params = new URLSearchParams({
+        response_type:         'code',
+        client_id:             CLIENT_ID,
+        scope:                 SCOPES,
+        redirect_uri:          REDIRECT_URI,
+        state,
+        code_challenge_method: 'S256',
+        code_challenge:        codeChallenge,
+      });
+
+      window.location.href = `${AUTH_URL}?${params}`;
+    }
+
+    async function exchangeCodeForTokens(code, verifier) {
+      if (!verifier) throw new Error('PKCE verifier missing — please try connecting again');
+
+      const res = await fetch(TOKEN_URL, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type:    'authorization_code',
+          code,
+          redirect_uri:  REDIRECT_URI,
+          client_id:     CLIENT_ID,
+          code_verifier: verifier,
+        }),
+      });
+
+      if (!res.ok) throw new Error(`Token exchange failed (${res.status})`);
+      persistTokens(await res.json());
+    }
+
+    function persistTokens({ access_token, refresh_token, expires_in }) {
+      store.set('access_token',  access_token);
+      store.set('expires_at',    Date.now() + expires_in * 1000);
+      // refresh_token is only present on the initial exchange, not every refresh
+      if (refresh_token) store.set('refresh_token', refresh_token);
+    }
+
+    async function refreshTokens() {
+      const refreshToken = store.get('refresh_token');
+      if (!refreshToken) throw new Error('No refresh token — please reconnect');
+
+      const res = await fetch(TOKEN_URL, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type:    'refresh_token',
+          refresh_token: refreshToken,
+          client_id:     CLIENT_ID,
+        }),
+      });
+
+      if (!res.ok) throw new Error(`Token refresh failed (${res.status}) — please reconnect`);
+      persistTokens(await res.json());
+    }
+
+    function isTokenExpired() {
+      const expiresAt = store.get('expires_at');
+      if (!expiresAt) return true;
+      return Date.now() > Number(expiresAt) - 60_000; // refresh 60s early
+    }
+
+    function isAuthenticated() {
+      return !!(store.get('access_token') && store.get('refresh_token'));
+    }
+
+    // ─── API ──────────────────────────────────────────────────────────────────
+    async function getToken() {
+      if (isTokenExpired()) await refreshTokens();
+      return store.get('access_token');
+    }
+
+    async function apiFetch(path, options = {}) {
+      const token = await getToken();
+
+      const res = await fetch(`${API_BASE}${path}`, {
+        ...options,
+        headers: {
+          Authorization:  `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          ...options.headers,
+        },
+      });
+
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        throw new Error(`Spotify ${res.status}: ${body || res.statusText}`);
+      }
+
+      return res.status === 204 ? null : res.json();
+    }
+
+    // ─── Shuffle logic ────────────────────────────────────────────────────────
+    async function pickRandomAlbum() {
+      // Call 1: get the total count of saved albums
+      const first = await apiFetch('/me/albums?limit=1');
+      const total = first.total;
+      if (!total) throw new Error('Your library has no saved albums');
+
+      // Call 2: fetch a single album at a random position
+      const offset = Math.floor(Math.random() * total);
+      const page   = await apiFetch(`/me/albums?limit=1&offset=${encodeURIComponent(offset)}`);
+      return page.items[0].album;
+    }
+
+    async function startAlbumPlayback(album) {
+      // No device_id → Spotify targets the currently active (or last active) device
+      await apiFetch('/me/player/play', {
+        method: 'PUT',
+        body:   JSON.stringify({ context_uri: album.uri }),
+      });
+    }
+
+    async function handleShuffle() {
+      setStatus('Picking a random album…');
+      btn.disabled = true;
+
+      try {
+        const album  = await pickRandomAlbum();
+        await startAlbumPlayback(album);
+        const artist = album.artists.map(a => a.name).join(', ');
+        setStatus(`Now playing: ${album.name} · ${artist}`);
+      } catch (err) {
+        console.error(err);
+        setStatus(err.message, true);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    // ─── UI ───────────────────────────────────────────────────────────────────
+    const btn    = document.getElementById('main-btn');
+    const status = document.getElementById('status');
+
+    function setStatus(msg, isError = false) {
+      status.textContent = msg;
+      status.className   = isError ? 'error' : '';
+    }
+
+    function renderAuthenticated() {
+      btn.textContent = 'Shuffle Album';
+      btn.onclick     = handleShuffle;
+    }
+
+    function renderUnauthenticated() {
+      btn.textContent = 'Connect Spotify';
+      btn.onclick     = redirectToSpotifyAuth;
+    }
+
+    // ─── Bootstrap ────────────────────────────────────────────────────────────
+    async function init() {
+      const params = new URLSearchParams(window.location.search);
+      const code   = params.get('code');
+      const error  = params.get('error');
+      const state  = params.get('state');
+
+      if (error) {
+        history.replaceState({}, '', window.location.pathname);
+        renderUnauthenticated();
+        setStatus(`Authorization failed: ${error}`, true);
+        return;
+      }
+
+      if (code) {
+        // Validate state to guard against CSRF
+        if (state !== store.get('pkce_state')) {
+          history.replaceState({}, '', window.location.pathname);
+          renderUnauthenticated();
+          setStatus('State mismatch — please try connecting again', true);
+          return;
+        }
+
+        // Read the verifier before cleaning up, then immediately discard it
+        // from storage to prevent replay — then pass it directly so the
+        // exchange function doesn't need to re-read (now-deleted) storage.
+        const verifier = store.get('pkce_verifier');
+        history.replaceState({}, '', window.location.pathname);
+        store.del('pkce_verifier');
+        store.del('pkce_state');
+
+        try {
+          setStatus('Connecting to Spotify…');
+          await exchangeCodeForTokens(code, verifier);
+          renderAuthenticated();
+          setStatus('Connected! Press Shuffle to play a random album.');
+        } catch (err) {
+          console.error(err);
+          renderUnauthenticated();
+          setStatus(err.message, true);
+        }
+        return;
+      }
+
+      // Normal page load
+      if (isAuthenticated()) {
+        renderAuthenticated();
+      } else {
+        renderUnauthenticated();
+      }
+    }
+
+    init();
+  </script>
+</body>
+</html>
